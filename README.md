@@ -1,4 +1,5 @@
 This repo contains a user-space adapter to interface the Alesis Multimix USB 2.0 external mixing desk with Linux Jack.
+This mixer here: https://www.alesis.com/products/view/multimix-8-usb-2.0
 
 The Alesis mixer supports 8 input channels plus stereo mix bus in and out via USB 2.0 using propietary protocols (NOT USB AUDIO CLASS COMPLIANT!)
 This mixer was sold from ~2006 onward and has now been EOL'd by Alesis. 
