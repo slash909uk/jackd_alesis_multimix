@@ -10,11 +10,16 @@ a user-space Linux adapter that works with Jack.
 This code depends on libm, libusb-1.0 and libjack. You'll need dev packages for these installed to compile it!
 
 Compile me:
-> gcc alesis_jackd_plugin.c /usr/lib/x86_64-linux-gnu/libjack.so /usr/lib/x86_64-linux-gnu/libm.so /usr/lib/x86_64-linux-gnu/libusb-1.0.so  -o jackd_alesis_multimix
+
+gcc alesis_jackd_plugin.c /usr/lib/x86_64-linux-gnu/libjack.so /usr/lib/x86_64-linux-gnu/libm.so /usr/lib/x86_64-linux-gnu/libusb-1.0.so  -o jackd_alesis_multimix
 
 usage: ./jackd_alesis_multimix <client name> [-v|-vv]
 (start jackd first!)
-> ./jackd_alesis_multimix alesus
+
+./jackd_alesis_multimix alesus
+
+output:
+
 OUT: drop:00000463 add:00001232 fb:-003 rbdata:00000324 IN: drop:00000549 add:00003108 ibdata:00001023
 
 The status line updates at about 10Hz with statistics:
