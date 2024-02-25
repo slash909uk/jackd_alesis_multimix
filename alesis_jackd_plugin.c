@@ -30,19 +30,20 @@
 #include <sys/time.h>   // timeval
 #include <sys/ioctl.h>	// key handler
 #include <string.h>
+#include <math.h> // round
 
 #include <jack/jack.h>
 #include <jack/ringbuffer.h>
 
 #include "libusb-1.0/libusb.h"
 
-#define RB_FRAME_LENGTH		2048
-#define RB_TARGET_LENGTH	512
-#define IB_FRAME_LENGTH		3072
-#define IB_TARGET_LENGTH	512
+#define RB_FRAME_LENGTH		3072
+#define RB_TARGET_LENGTH	768
+#define IB_FRAME_LENGTH		8192
+#define IB_TARGET_LENGTH	1536
 
-#define PLAY_LATENCY		2200 // frames, ~23ms
-#define CAP_LATENCY		3200 // frames, ~33ms
+#define AVGSCALE		300	// scale factor used to update ring buffer moving avergae per jack period. divisor
+#define DEADBAND		48	// how many frames off target before we make a resample adjustment? 96 frames = 1ms
 
 // Alesis MultiMix8 USB 2.0, 24-bit 96kHz stereo out, 10 channels in (private syntax)
 #define targetVendorId			0x13b2
@@ -60,6 +61,9 @@
 #define fbAdjust			3
 #define innames				{"ch1","ch3","ch5","ch7","mixL","ch2","ch4","ch6","ch8","mixR"}
 #define outnames			{"2trackL","2trackR"}
+
+#define PLAY_LATENCY		(480*outpreload+RB_TARGET_LENGTH) // frames, 480 * USB preload queue plus the ring buffer
+#define CAP_LATENCY		(2048+IB_TARGET_LENGTH) // frames, 2048 in USB BULK transfer plus the ring buffer
 
 // hacked from libmaru
 #define USB_CLASS_AUDIO                1
@@ -115,21 +119,28 @@ jack_port_t *input_port[2];
 jack_client_t *client;
 int running = 0;
 
+// some consts to calculate for later
+const size_t sample_size = sizeof(jack_default_audio_sample_t);
+const size_t ibframe = 10*sample_size;
+const size_t ibsize = ibframe*IB_FRAME_LENGTH;
+const size_t ibtlow = ibframe*(IB_TARGET_LENGTH-DEADBAND);
+const size_t ibthigh = ibframe*(IB_TARGET_LENGTH+DEADBAND);
+const size_t rbframe = 2*sample_size;
+const size_t rbsize = rbframe*RB_FRAME_LENGTH;
+const size_t rbtlow = rbframe*(RB_TARGET_LENGTH-DEADBAND);
+const size_t rbthigh = rbframe*(RB_TARGET_LENGTH+DEADBAND);
+
 // ring buffer for 10 channel flow from USB in
 jack_ringbuffer_t *ib;
 long ibdrop = 0;
 long ibadd = 0;
-long ibavg = 0;
+float ibavg = 0;
 
 // ring buffer for 2 channel flow to USB out
 jack_ringbuffer_t *rb;
 long rbdrop = 0;
 long rbadd = 0;
 long rbavg = 0;
-
-const size_t sample_size = sizeof(jack_default_audio_sample_t);
-const size_t rbsize = 2*sample_size*RB_FRAME_LENGTH;
-const size_t ibsize = 10*sample_size*IB_FRAME_LENGTH;
 
 // Logging function - treat as printf(...) with leading level
 // lvl: debug=0
@@ -207,35 +218,47 @@ int jack_process (jack_nframes_t nframes, void *arg)
 
 	// fill output ports from input ring buffer
 	int nb = jack_ringbuffer_read_space(ib); // bytes available
-	int nr = nframes*sample_size*10; // bytes needed
+	int nr = nframes*ibframe; // bytes needed by jack
 	int na = 0; // bytes to transfer
 	// check for buffer underrun
 	if(nb<nr) {
-		na=nb; // this should be safe if we read/write in blocks of 10 samples so we don't go out of sync
+		logger(1,"\nIN underrun! buf=%d\n",nb);
+		// drop the frame to let input catch up
+		// reset moving average to depth
+		ibavg = nb;
 	} else {
-		// adjust samples read to keep buffer at target size
-		na = (nb-nr)<10*sample_size*IB_TARGET_LENGTH ? nr-10*sample_size : nr;
+		// adjust samples read to keep buffer at target size - clamp to +/- 1 frame per period. Allow for jack internal latency also
+		// update moving average of buffer that will be remaining AFTER we read it
+		ibavg += ((nb-nr-jack_frames_since_cycle_start(client)*ibframe)/AVGSCALE)-(ibavg/AVGSCALE);
+		int sd = 0;
+		// clamp to +/- 1 frames
+		if(ibavg<ibtlow) { sd = -1; }
+		if(ibavg>ibthigh) { sd = 1; }
+		na = nr+sd*ibframe; // adjust bytes to read
+		na = na>nb ? nb : na; // clamp to available bytes
+		ibdrop += sd==1?10:0; // count resample in samples dropped
 	}
-	static jack_default_audio_sample_t ab[1024*10]; // temp transfer buffer - max 1024 frames!
-	jack_ringbuffer_read(ib, (void *)ab, na);
-	// duplicate last samples as required
+	static jack_default_audio_sample_t ab[1025*10]; // temp transfer buffer - max 1024 frames! 1 extra allowed for dropping frames
 	jack_default_audio_sample_t *pab = ab+(na/sample_size); // pointer to next sample in buffer
-	while(na<nr) {
-		*pab = *(pab-10);
-		pab++;
-		na+=sample_size;
-		ibadd++; // count underrun in samples added
-	}
-	pab = ab;
-	for(int i=0; i<nframes; i++ ) {
-		// fill up outputs from the audio buffer in blocks of 10 channels
-		for(int ch=0; ch<10; ch++) {
-			*(out[ch]) = *pab;
-			out[ch]++;
+	if(na>0) {
+		jack_ringbuffer_read(ib, (void *)ab, na); // 
+		// duplicate last samples as required
+		while(na<nr) {
+			*pab = *(pab-10);
 			pab++;
+			na+=sample_size;
+			ibadd++; // count resample in samples added
 		}
-	}
-	
+		pab = ab;
+		for(int i=0; i<nframes; i++ ) {
+			// fill up outputs from the audio buffer in blocks of 10 channels
+			for(int ch=0; ch<10; ch++) {
+				*(out[ch]) = *pab;
+				out[ch]++;
+				pab++;
+			}
+		}
+	}	
 	
 	// fill output ring buffer from input ports
 	pab = ab;
@@ -247,18 +270,39 @@ int jack_process (jack_nframes_t nframes, void *arg)
 			pab++;
 		}
 	}
-	// throttle writes to maintain buffer content size and thus latency
-	nr = jack_ringbuffer_write_space(rb) / (2*sample_size); // how many frames of space have we got?
-	size_t rbs = jack_ringbuffer_read_space(rb);
-	if (nr>=nframes) { // we have enough space, adjust nr to maintain target size in the buffer
-		nr = rbs > 2*sample_size*RB_TARGET_LENGTH ? nframes-1 : nframes;
+	nb = jack_ringbuffer_read_space(rb);
+	nr = nframes*rbframe;
+	// check for buffer overrun - allow for an extra frame of padding
+	if((nr+1)>(na=jack_ringbuffer_write_space(rb))) {
+		logger(1,"\nOUT: overrun! space=%d\n",na);
+		// drop incoming and reset moving avg to current depth
+		rbavg = nb;
+	} else {
+		// adjust samples written to keep buffer at target size - clamp to +/- 1 frame per period, allow for jack internal latency also
+		// update moving average of buffer
+		rbavg += ((nb+jack_frames_since_cycle_start(client)*rbframe)/AVGSCALE)-(rbavg/AVGSCALE);
+		int sd = 0;
+		// clamp to +/- 1 frames
+		na = nr;
+		if(rbavg<rbtlow) {
+			// if too low add a duplicate sample
+			*pab = *(pab-2);
+			pab++;
+			*pab = *(pab-2);
+			na += rbframe;
+			rbadd++; // count adds
+		}
+		if(rbavg>rbthigh) {
+			// if too high drop a frame
+			na -= rbframe;
+			rbdrop++; //count drops
+		}
+		// write to buffer
+		if(jack_ringbuffer_write(rb, (void *) ab, na)<na) {
+			logger(1,"\nOutput buffer error QUIT\n"); // this should NOT happen!
+			return 1;
+		}
 	}
-	rbdrop += (nframes-nr)*2; // record dropped sample count
-	if(jack_ringbuffer_write(rb, (void *) ab, 2*nr*sample_size)<2*nr*sample_size) {
-		logger(1,"\nOutput buffer overrun! ibs=%d nr=%d\n",rbs,nr); // this should NOT happen!
-	}
-	// update moving avg buffer size taking 1/8 of each new value
-	rbavg += (rbs>>3)-(rbavg>>3);
 
 	return 0;      
 }
@@ -287,40 +331,34 @@ static void cb_out(struct libusb_transfer *transfer)
 		if(sd!=0) { 
 			outDelta=0; // reset accumulator if we adjusted this transfer
 		}
-		int nr = 2*sample_size*(480+sd); // bytes required from ring buffer
+		int nr = rbframe*(480+sd); // bytes required from ring buffer
 		transfer->length = 2880+(sd*6); // adjust bytes conveyed in transaction
 		transfer->iso_packet_desc[39].length = 72+(sd*6); // adjust size of last ISO subframe to cater!
 		// collect audio from ring buffer - pad it out by duplicating if there isn't enough
 		int nb = jack_ringbuffer_read_space(rb); // bytes available
-		int na = 0; // bytes to actually transfer
+		int na = nr; // bytes to actually transfer
 		if(nb<nr) {
-			na = nb;
-		} else {
-			// adjust na to keep buffer at target size 
-			na = nb<2*sample_size*RB_TARGET_LENGTH ? nr-2*sample_size : nr;
+			logger(1,"\nOUT underrun! buf=%d\n",nb);
+			// send zeros, leave samples in buffer
+			memset(transfer->buffer,0,transfer->length);
+			na = 0;
 		}
-		static jack_default_audio_sample_t ab[962]; // temp transfer buffer, 960 sample + 2 extra
-		jack_ringbuffer_read(rb, (void *)ab, na);
-		// duplicate last samples as required
-		jack_default_audio_sample_t *pab = ab+(na/sample_size); // pointer to next sample in buffer
-		while(na<nr) {
-			*pab = *(pab-2);
-			pab++;
-			na+=sample_size;
-			rbadd++; // count added bytes in samples
-		}
-		// transcode to S24_3LE into USB output buffer
-		pab = ab;
-		char *bp = transfer->buffer;
-		for(int i=0; i<480+sd; i++) {
-			for(int ch=0; ch<2; ch++) {
-				int sample = (*pab)*((float)INT_MAX);
-				for(int b=0; b<3; b++) {
-					sample >>=8; //shift byte down
-					*bp = sample&0xff; // mask and add to output
-					bp++; // increment output pointer
+		static jack_default_audio_sample_t ab[962]; // temp transfer buffer, 480 frames + 1 extra for adjustment
+		if(na>0) {
+			jack_ringbuffer_read(rb, (void *)ab, na);
+			// transcode to S24_3LE into USB output buffer
+			jack_default_audio_sample_t *pab = ab;
+			char *bp = transfer->buffer;
+			for(int i=0; i<480+sd; i++) {
+				for(int ch=0; ch<2; ch++) {
+					int sample = (*pab)*((float)INT_MAX);
+					for(int b=0; b<3; b++) {
+						sample >>=8; //shift byte down
+						*bp = sample&0xff; // mask and add to output
+						bp++; // increment output pointer
+					}
+					pab++;
 				}
-				pab++;
 			}
 		}
 		int r=0;
@@ -365,12 +403,13 @@ static void bulk_in(struct libusb_transfer *transfer)
 			// 2 rows make up all the channel samples for one frame
 			// 2048 frames per transfer or 4096 rows
 			char *bpos=transfer->buffer; // input byte position in transfer buffer
-			int nr = (jack_ringbuffer_write_space(ib) / (10*sample_size))*2; // how many rows of space have we got? Make sure this is a multiple of 2 so we don't drop half a frame..
-			size_t ibs = jack_ringbuffer_read_space(ib);
-			if (nr>4096) { // we have enough space, adjust nr to maintain read space at 1/4 the configured buffer size
-				nr = ibs > 10*sample_size*IB_TARGET_LENGTH ? 4094 : 4096;
+			int nr = (jack_ringbuffer_write_space(ib) / ibframe)*2; // how many rows of space have we got? Make sure this is a multiple of 2 so we don't drop half a frame..
+			
+			if (nr<4096) { // overrun! just drop data that does not fit
+				logger(1,"\nIN overrun! nr=%d\n",nr);
+			} else {
+				nr=4096; // process all rows if they fit
 			}
-			ibdrop += 2048*10 - nr*5; // count drops in samples
 			
 			// process rows into temp
 			float a[10*2048];
@@ -397,11 +436,10 @@ static void bulk_in(struct libusb_transfer *transfer)
 			}
 			// write temp to ring buffer
 			if(jack_ringbuffer_write(ib, (void *) a, 5*nr*sample_size)<5*nr*sample_size) {
-				logger(1,"\nInput buffer overrun! nr=%d\n",nr); // this should NOT happen!
+				logger(1,"\nIN buffer error! QUIT\n"); // this should NOT happen!
+				done=1;
 			}
 			libusb_submit_transfer(transfer); // queue it back up again
-			// update moving average buffer size with 1/8 of current buffer size
-			ibavg += (ibs>>3)-(ibavg>>3);
 		}	
 	}
 }
@@ -493,11 +531,12 @@ static void run_audio(libusb_device_handle *hdev, int epOut, int epInFb, int epI
 		if(r != 0) { logger(1, libusb_strerror(r)); break;}
 		if(++cnt>100) { 
 			cnt=0;
-			fprintf(stderr,"OUT: drop:%08ld add:%08ld fb:%+04d rbdata:%08ld IN: drop:%08ld add:%08ld ibdata:%08ld\r",
-				rbdrop/2, rbadd/2, outDelta, rbavg/(2*sample_size),
-				ibdrop/10, ibadd/10, ibavg/(10*sample_size));
+			fprintf(stderr,"OUT: drop:%08ld add:%08ld fb:%+04d rbdata:%08ld IN: drop:%08ld add:%08ld ibdata:%08.1f\r",
+				rbdrop/2, rbadd/2, outDelta, rbavg/rbframe,
+				ibdrop/10, ibadd/10, ibavg/ibframe);
 		}
 	}
+	fflush(stdout);
 	running=0;
 	// cancel transfers and run the loop for another second
 	
@@ -749,7 +788,8 @@ int main(int argc, char **argv)
 	
 	// INIT USB end
 
-	logger(0,"Interfaces open! process audio...\n");
+	logger(0,"Interfaces open! process audio... target RB=%d-%d/%d, target IB=%d-%d/%d\n",
+		rbtlow/rbframe,rbthigh/rbframe,rbsize/rbframe,ibtlow/ibframe,ibthigh/ibframe,ibsize/ibframe);
 
 	// start JACK callbacks here
 
