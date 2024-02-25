@@ -11,5 +11,11 @@ clean:
 bin:
 	mkdir -p bin
 
+install: all
+	install -o root -g root -m 755 bin/jackd_alesis_multimix /usr/local/bin
+
+uninstall:
+	rm -f /usr/local/bin/jackd_alesis_multimix
+
 bin/%: %.c
 	$(CC) -o $@ $(CFLAGS) $< $(LIBS)
