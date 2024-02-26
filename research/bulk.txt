@@ -1,0 +1,42 @@
+Alesis USB bul protocol hacking
+
+What we know:
+
+USB endpoints:
+0: control as normal
+1: (IN) some kind of incoming sync/clock? contains blocks of 2f/30/31 (dec 48+/-1) for 48k or 5f/60/61 (dec 96+/-1) for 96k. Sent @ 2ms, 6 values per frame @96k
+2: (OUT) PCM 2 channel audio, 24bit, lrlr.. samples, 40 iso pkt per usb frame, 36 / 72 bytes per iso pkt (12 / 24 samples) per 48k/96k. Sent @ 5ms, 480 / 960 samples per frame (96k / 192k sample/sec)
+6: (IN) MYSTERY USB BULK we know this must contain all incoming channel data, there are no other USB endpoints. 128 x 1024 bytes payload per frame (133072 bytes)
+
+BULK format:
+Frame rate: 42.5 / 21.25 ms per frame (REALLY SLOW!) per 48k/96k. Probably 2040 time samples per frame ?
+133072 / 2040 => 65 bytes available per time sample. At 24bit (3 bytes) PCM can carry max 21 channels - more than enough!
+
+payload seems to be structured as 32 byte chunks:
+11 11 11 11  11 01 11 11  11 01 11 11  11 01 01 15  02 08 03 04  03 02 0D 1C  00 00 00 00  00 00 00 00
+
+repeating pattern of 8 bytes of 00 occurs throughout each bulk payload - perhaps this is the spare capacity for the 16-channel mixer product in the same family?
+
+no additional blank/zero filled elements anywhere - all 4096 rows follow same pattern.
+
+all byte values appear to be between 00-1F. (0000 0000 - 0001 1111) - that is 5 bits of data only?
+[audio level was ~0dB on the meter, bit lower on Tracktion input.]
+
+Seems unlikely that 3 consecutive bytes are a channel sample - lower bytes would cover full range of values surely?
+
+What if 1 sample is spread across 24 bytes? each channel is a different bit offset in the byte? Then 10 channels would need 2 chunks (5 in each)
+let's try this by hand for the above row...
+
+bit offset into byte: bit -> hex
+0: 1 1 1 1  1 1 1 1  1 1 1 1  1 1 1 1  0 0 1 0  1 0 1 0 -> xFFFF2A
+1: 0 0 0 0  0 0 0 0  0 0 0 0  0 0 0 0  1 0 1 0  1 1 0 1 -> x0000AD
+2: 0 0 0 0  0 0 0 0  0 0 0 0  0 0 0 1  0 0 0 1  0 0 1 0 -> x000112
+3: 0 0 0 0  0 0 0 0  0 0 0 0  0 0 0 0  0 1 0 0  0 0 1 1 -> x000045
+4:
+5:
+
+
+0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
+0000 0001 0010 0011 0100 0101 0110 0111 1000 1001 1010 1011 1100 1101 1110 1111
+
+.. does not seem to be good. values created are very high/low due to repeating pattern in first part of block.
