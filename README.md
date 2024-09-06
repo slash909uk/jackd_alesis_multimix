@@ -1,3 +1,5 @@
+ARCHIVED: repo moved to: https://codeberg.org/slash909uk/jackd_alesis_multimix
+
 This repo contains a user-space adapter to interface the Alesis Multimix USB 2.0 external mixing desk with Linux Jack.
 This mixer here: https://www.alesis.com/products/view/multimix-8-usb-2.0
 
